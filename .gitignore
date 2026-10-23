@@ -1,0 +1,17 @@
+# training / eval data, model weights and run outputs stay out of git
+data/
+models/
+outputs/
+checkpoints/
+wandb/
+
+# python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+.pytest_cache/
+.ruff_cache/
+.venv/
+*.log
+.DS_Store

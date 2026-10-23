@@ -1,0 +1,4 @@
+# Registered into verl's agent-loop registry by every AgentLoopWorker
+# (actor_rollout_ref.rollout.agent.agent_loop_config_path).
+- name: allocate_repair_agent
+  _target_: allocate_repair.agent_loop.PhaseAwareSingleTurnAgentLoop

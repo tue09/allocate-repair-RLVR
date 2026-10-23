@@ -1,0 +1,151 @@
+# allocate-repair trainer config: verl's ppo_trainer.yaml + the allocate_repair section.
+# Everything here can be overridden from the command line (see scripts/run_*.sh).
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+allocate_repair:
+  # repairs per failed phase-1 response (0 = solve-only baseline; otherwise >= 2).
+  # G is actor_rollout_ref.rollout.n.
+  M: 4
+  # L_total = L_solve + repair_lambda * L_repair
+  repair_lambda: 1.0
+  output_dir: ${trainer.default_local_dir}/allocate_repair_logs
+  data_manifest: null
+
+  # per-phase decoding settings; max_tokens is the per-phase generation limit
+  solve:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 8192
+  repair:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 8192
+    # cap on the tokens of the previous answer shown in the repair prompt (the tail is kept)
+    max_previous_answer_tokens: 1024
+    prompt_format: single_turn   # single_turn | multi_turn
+    answer_header: "Previous answer:"
+    instruction: >-
+      The previous answer to this question is incorrect. Explain why it is incorrect and solve the problem again.
+      End with your corrected final answer on its own line in the form "Answer: $Answer".
+    extraction_mode: auto        # auto | think | full
+    think_end: "</think>"
+    # what to show when no answer can be extracted after the think block: placeholder | skip (no repair)
+    extraction_failure_policy: placeholder
+    extraction_failure_placeholder: "(The previous response ended without a final answer after its reasoning.)"
+  # held-out evaluation is first-attempt only (original question; sampling from rollout.val_kwargs)
+  validation:
+    max_tokens: ${allocate_repair.solve.max_tokens}
+
+  logging:
+    examples_interval: 10      # dump examples every N steps (and at step 1); 0 disables
+    examples_num_questions: 2
+    examples_max_chars: 20000
+  wandb:
+    mode: offline
+    dir: ${trainer.default_local_dir}/wandb
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+
+data:
+  max_prompt_length: 1024
+  max_response_length: ${actor_rollout_ref.rollout.response_length}
+  train_batch_size: 64
+  filter_overlong_prompts: true
+  truncation: error
+  shuffle: true
+  seed: 42
+  dataloader_num_workers: 4
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    loss_agg_mode: seq-mean-token-mean
+    ppo_epochs: 1
+    ppo_mini_batch_size: ${data.train_batch_size}
+    use_dynamic_bsz: true
+    # must be >= rollout.prompt_length + rollout.response_length (one full sequence)
+    ppo_max_token_len_per_gpu: 12288
+    entropy_from_logits_with_chunking: true
+    use_kl_loss: false
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    clip_ratio_low: 0.2
+    clip_ratio_high: 0.2
+    optim:
+      lr: 1.0e-6
+      lr_warmup_steps: 0
+      weight_decay: 0.01
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  ref:
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 16384
+    fsdp_config:
+      param_offload: true
+  rollout:
+    name: vllm
+    mode: async
+    n: 8
+    temperature: ${allocate_repair.solve.temperature}
+    top_p: ${allocate_repair.solve.top_p}
+    top_k: ${allocate_repair.solve.top_k}
+    # covers phase-1 prompts and the longer phase-2 prompts (question + previous answer + feedback)
+    prompt_length: 2560
+    response_length: 8192
+    # keep = prompt_length + response_length (vLLM otherwise uses the model's full context)
+    max_model_len: 10752
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.6
+    max_num_batched_tokens: 16384
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 16384
+    calculate_log_probs: true
+    val_kwargs:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: -1
+      n: 4
+      do_sample: true
+    agent:
+      num_workers: 8
+      default_agent_loop: allocate_repair_agent
+      agent_loop_config_path: ???
+
+reward:
+  num_workers: 8
+  custom_reward_function:
+    path: pkg://allocate_repair.reward_fn
+    name: compute_score
+
+trainer:
+  use_v1: false
+  balance_batch: true
+  logger: ["console", "wandb"]
+  project_name: allocate_repair_rlvr
+  experiment_name: allocate_repair
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_epochs: 1
+  total_training_steps: null
+  save_freq: 50
+  test_freq: 10
+  val_before_train: true
+  log_val_generations: 0
+  max_actor_ckpt_to_keep: 3

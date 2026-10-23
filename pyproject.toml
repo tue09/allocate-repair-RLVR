@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "allocate-repair"
+version = "0.1.0"
+description = "Two-phase (solve, explain-and-repair) GRPO training on verl"
+requires-python = ">=3.10,<3.13"
+# Runtime dependencies (verl, vLLM, torch, ...) are installed by scripts/setup_env.sh.
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["allocate_repair*"]
+
+[tool.setuptools.package-data]
+allocate_repair = ["config/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
