@@ -4,6 +4,7 @@ models/
 outputs/
 result/
 checkpoints/
+trajectories/
 wandb/
 
 # python / tooling
