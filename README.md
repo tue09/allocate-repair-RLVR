@@ -20,8 +20,6 @@ then verifies its own verdicts, round after round.
 <a href="#highlights">Highlights</a> &nbsp;•&nbsp;
 <a href="#motivation">Motivation</a> &nbsp;•&nbsp;
 <a href="#method">Method</a> &nbsp;•&nbsp;
-<a href="#quick-start">Quick start</a> &nbsp;•&nbsp;
-<a href="#configuration">Configuration</a> &nbsp;•&nbsp;
 <a href="#citation">Citation</a>
 </p>
 
@@ -96,18 +94,18 @@ Yellow: target verdicts. Each match (✓/✗) determines the next target and sup
 ### Phase 1 · Solution generation
 
 For each question $`Q`$ with reference answer $`R`$, the policy samples $`\{S_i\}_{i=1}^{G} \sim \pi_{\theta_{\mathrm{old}}}(\cdot \mid Q)`$.
-A rule-based verifier assigns each solution a binary outcome reward $`r_i = \operatorname{Verify}(S_i, R) \in \{0, 1\}`$,
+A rule-based verifier assigns each solution a binary outcome reward $`r_i = \mathrm{Verify}(S_i, R) \in \{0, 1\}`$,
 and the solutions are trained with GRPO's group-normalized advantage:
 
 ```math
-\hat A_{i,t}=\frac{r_i-\operatorname{mean}\big(\{r_j\}_{j=1}^{G}\big)}{\operatorname{std}\big(\{r_j\}_{j=1}^{G}\big)} .
+\hat A_{i,t}=\frac{r_i-\mathrm{mean}\big(\{r_j\}_{j=1}^{G}\big)}{\mathrm{std}\big(\{r_j\}_{j=1}^{G}\big)} .
 ```
 
 <details>
 <summary><b>The GRPO objective</b></summary>
 
 ```math
-\mathcal J_{\mathrm{GRPO}}(\theta)=\mathbb E\Bigg[\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big(\min\big(\rho_{i,t}(\theta)\hat A_{i,t},\ \operatorname{clip}\big(\rho_{i,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A_{i,t}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
+\mathcal J_{\mathrm{GRPO}}(\theta)=\mathbb E\Bigg[\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big(\min\big(\rho_{i,t}(\theta)\hat A_{i,t},\ \mathrm{clip}\big(\rho_{i,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A_{i,t}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
 \qquad
 \rho_{i,t}(\theta)=\frac{\pi_\theta(o_{i,t}\mid Q,o_{i,<t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t}\mid Q,o_{i,<t})}
 ```
@@ -126,7 +124,7 @@ x_d=\begin{cases}(Q,\,S), & d=1,\\[2pt](Q,\,S,\,A_{d-1}), & d=2,\ldots,M,\end{ca
 \qquad
 V_d\sim\pi_{\theta_{\mathrm{old}}}(\cdot\mid x_d),
 \qquad
-\bar A_d=\operatorname{ExtractAnswer}(V_d).
+\bar A_d=\mathrm{ExtractAnswer}(V_d).
 ```
 
 $`\bar A_d`$ is the final answer after the closing `</think>` tag and contains a binary verdict $`v_d`$. The reasoning
@@ -156,9 +154,9 @@ The **target chain** $`C_M^\star=(v_1^\star,\ldots,v_M^\star)`$ holds the correc
 from the phase-1 outcome, and each later target records whether the policy was right one depth earlier:
 
 ```math
-v_1^\star=\operatorname{Verify}(S,R),
+v_1^\star=\mathrm{Verify}(S,R),
 \qquad
-v_d^\star=\mathbf 1\big[v_{d-1}=v_{d-1}^\star\big],
+v_d^\star=\mathbf{1}\big[v_{d-1}=v_{d-1}^\star\big],
 \quad d=2,\ldots,M.
 ```
 
@@ -167,7 +165,7 @@ its own binary correctness reward. Equivalently, a verdict is correct exactly wh
 the solution's outcome:
 
 ```math
-r_d^{\mathrm{verify}}=\mathbf 1\big[v_d=v_d^\star\big]=\mathbf 1\big[c_d=\operatorname{Verify}(S,R)\big]\in\{0,1\}.
+r_d^{\mathrm{verify}}=\mathbf{1}\big[v_d=v_d^\star\big]=\mathbf{1}\big[c_d=\mathrm{Verify}(S,R)\big]\in\{0,1\}.
 ```
 
 <details open>
@@ -184,7 +182,7 @@ r_d^{\mathrm{verify}}=\mathbf 1\big[v_d=v_d^\star\big]=\mathbf 1\big[c_d=\operat
 
 Round 1 wrongly accepts the solution. Round 2 correctly rejects that verdict. Round 3 correctly keeps round 2's
 verdict. Round 4 wrongly overturns it. The summary score
-$`r^{(M)}_{\mathrm{verify}} = \frac1M \sum_d r_d^{\mathrm{verify}} = \frac24`$ is kept for monitoring only: training uses
+$`r^{(M)}_{\mathrm{verify}} = \frac{1}{M} \sum_d r_d^{\mathrm{verify}} = \frac{2}{4}`$ is kept for monitoring only: training uses
 the individual round rewards.
 
 </details>
@@ -202,14 +200,14 @@ different branches or depths:
 Phase 2 is then trained with the round-level clipped policy-gradient objective
 
 ```math
-\mathcal J_{\mathrm{verify}}(\theta)=\mathbb E\Bigg[\frac{1}{GM}\sum_{i=1}^{G}\sum_{d=1}^{M}\frac{1}{|V_{i,d}|}\sum_{t=1}^{|V_{i,d}|}\Big(\min\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta)\hat A^{\mathrm{verify}}_{i,d},\ \operatorname{clip}\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A^{\mathrm{verify}}_{i,d}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
+\mathcal J_{\mathrm{verify}}(\theta)=\mathbb E\Bigg[\frac{1}{GM}\sum_{i=1}^{G}\sum_{d=1}^{M}\frac{1}{|V_{i,d}|}\sum_{t=1}^{|V_{i,d}|}\Big(\min\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta)\hat A^{\mathrm{verify}}_{i,d},\ \mathrm{clip}\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A^{\mathrm{verify}}_{i,d}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
 ```
 
 where $`\rho^{\mathrm{verify}}_{i,d,t}(\theta)=\pi_\theta(V_{i,d,t}\mid x_{i,d},V_{i,d,<t})\,/\,\pi_{\theta_{\mathrm{old}}}(V_{i,d,t}\mid x_{i,d},V_{i,d,<t})`$,
-and the policy maximizes
+and the policy maximizes the combined objective
 
 ```math
-\boxed{\;\mathcal J(\theta)=\mathcal J_{\mathrm{GRPO}}(\theta)+\mathcal J_{\mathrm{verify}}(\theta)\;}
+\mathcal J(\theta)=\mathcal J_{\mathrm{GRPO}}(\theta)+\mathcal J_{\mathrm{verify}}(\theta).
 ```
 
 **Design choices**
@@ -264,124 +262,6 @@ Verdict: INCORRECT (the previous verdict is wrong)
 ```
 
 </details>
-
-<a id="quick-start"></a>
-
-## 🚀 Quick start
-
-> [!TIP]
-> Reference setup: **4× NVIDIA A100 (40 GB)**, **Qwen3-1.7B** in thinking mode, **DAPO-Math-17k**.
-
-```bash
-# 0 · clone (verl v0.9.1 is pinned as a submodule)
-git clone --recursive https://github.com/tue09/allocate-repair-RLVR.git
-cd allocate-repair-RLVR
-
-# 1 · environment: conda env "arrlvr"  (torch 2.11 · vLLM 0.24 · flash-attn 2.8.3 · verl 0.9.1)
-bash scripts/setup_env.sh
-conda activate arrlvr
-
-# 2 · data: DAPO-Math-17k (deduplicated + held-out split), AIME 2024, AIME 2025, MATH-500
-HF_HUB_OFFLINE=0 bash scripts/download_data.sh
-
-# 3 · train: G = 4 solutions per question, verification depth M = 3
-MODEL_PATH=/path/to/Qwen3-1.7B bash scripts/train_verify_depth_v2_qwen3_dapo.sh
-```
-
-More ways to launch:
-
-```bash
-G=8 M=5 bash scripts/train_verify_depth_v2_qwen3_dapo.sh          # wider and deeper
-DRY_RUN=1 bash scripts/train_verify_depth_v2_qwen3_dapo.sh        # print the resolved config, no training
-EXP_NAME=<run> bash scripts/train_verify_depth_v2_qwen3_dapo.sh   # resume a run from its latest checkpoint
-bash scripts/train_verify_depth_v2_qwen3_dapo.sh trainer.save_freq=50   # append any Hydra override
-```
-
-> [!IMPORTANT]
-> A default run is 250 steps, so start it inside `tmux`. Output paths default to our cluster layout: set
-> `MODEL_PATH`, `CKPT_ROOT` and `TRAJECTORY_DIR` for your machine. Results are mirrored to a Hugging Face dataset
-> repo while training; set `HF_SYNC=0` to turn that off, or `HF_REPO=<user>/<repo>` to redirect it.
-
-<details>
-<summary><b>Environment details</b></summary>
-<br>
-
-`scripts/setup_env.sh` reads the NVIDIA driver version and installs a matching build into a conda env (Python 3.12):
-
-| Driver | Build | Installed |
-|:---:|:---:|:---|
-| ≥ 580 | `cu130` | torch 2.11.0, vLLM 0.24.0 and flash-attn 2.8.3, all prebuilt |
-| 525 – 579 | `cu129` | torch 2.11.0 + vLLM 0.24.0 CUDA 12.9 wheels; flash-attn compiled for A100 (sm80) |
-
-All other packages are pinned to verl's lock file (`requirements/constraints-common.txt`). The script ends with
-`scripts/check_env.py`, which checks versions, GPUs, a flash-attn kernel and the verl commit.
-
-</details>
-
-<details>
-<summary><b>Data details</b></summary>
-<br>
-
-| Split | Questions | Source |
-|:---|---:|:---|
-| train | 16,373 | DAPO-Math-17k |
-| held-out validation | 500 | DAPO-Math-17k, disjoint from train |
-| AIME 2024 / AIME 2025 | 30 / 30 | competition problems |
-| MATH-500 | 500 | MATH test subset |
-
-DAPO-Math-17k ships 1.79M rows: 17,917 questions repeated 100 times each. We collapse the copies, merge
-near-duplicate questions (normalized text), drop questions with conflicting reference answers, and remove questions
-that overlap the evaluation sets. All prompts use the same answer format and the same rule-based verifier.
-Evaluation measures first-attempt accuracy from the question alone.
-
-</details>
-
-<a id="configuration"></a>
-
-## ⚙️ Configuration
-
-The main knobs of `scripts/train_verify_depth_v2_qwen3_dapo.sh` are environment variables:
-
-| Variable | Default | Meaning |
-|:---|:---:|:---|
-| `G` | 4 | solutions per question (phase 1, GRPO group size) |
-| `M` | 3 | verification depth: rounds in the chain of each solution |
-| `TRAIN_BATCH_SIZE` | 64 | questions per optimizer step |
-| `TOTAL_STEPS` | 250 | training steps (about one epoch) |
-| `LR` | 1e-6 | AdamW learning rate |
-| `ADVANTAGE_BASELINE` | 0.5 | fixed baseline $`b`$ in $`\hat A_d^{\mathrm{verify}} = r_d^{\mathrm{verify}} - b`$ |
-| `USE_KL_LOSS` · `KL_LOSS_COEF` | False · 0.001 | KL penalty $`\beta`$ toward the reference policy |
-| `SOLVE_MAX_TOKENS` | 8192 | generation budget of a solution |
-| `VERIFY_MAX_TOKENS` | 4096 | generation budget of a verification round |
-| `MAX_SOLUTION_TOKENS` | 1024 | solution text shown to the verifier (tail kept) |
-| `MAX_ROUND_TOKENS` | 512 | previous final answer shown to the next round (tail kept) |
-| `SOLVE_TEMPERATURE` · `VERIFY_TEMPERATURE` | 1.0 · 1.0 | sampling temperature per phase |
-| `VAL_N` · `VAL_TEMPERATURE` · `VAL_TOP_P` | 4 · 0.6 · 0.95 | evaluation sampling |
-| `SAVE_FREQ` | 100 | checkpoint interval (plus the last step) |
-| `CUDA_VISIBLE_DEVICES` | `0,1,2,3` | GPUs |
-
-## 📊 Outputs and monitoring
-
-```text
-$CKPT_ROOT/$EXP_NAME/
-├── global_step_N/            checkpoints (re-launch with the same EXP_NAME to resume)
-├── metrics/*.jsonl           per-step metrics
-├── allocate_repair_logs/     verification-chain examples and run info (config, versions, data manifest)
-├── wandb/                    offline Weights & Biases run
-└── train.log, command.sh
-$TRAJECTORY_DIR/step_NNNNN.jsonl.gz    every prompt and full output of every step
-```
-
-Plot a run with `python scripts/plot_run.py <EXP_NAME> --runs-root <dir>`. The panels are written to `result/<EXP_NAME>/`.
-
-| Metric | Meaning |
-|:---|:---|
-| `solve/reward_mean` | phase-1 accuracy (mean $`r_i`$) |
-| `verify/d{d}/match_rate` | round accuracy at depth $`d`$ (mean $`r_d^{\mathrm{verify}}`$) |
-| `verify/d{d}/conclusion_acc` | accuracy of the running conclusion $`c_d`$ |
-| `verify/d1/acc_on_{correct,wrong}_solutions` | first-round accuracy, split by solution outcome |
-| `verify/reward_mean` | summary score $`r^{(M)}_{\mathrm{verify}}`$ |
-| `eval/first_attempt_acc/{dapo_heldout,aime24,aime25,math500}` | held-out accuracy from the question alone |
 
 ## 🗂️ Repository layout
 
