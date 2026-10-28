@@ -13,6 +13,7 @@ One logical training step:
    optimizer step minimizes L_solve + lambda * L_repair (see ``allocate_repair.losses``).
 """
 
+import gzip
 import json
 import os
 from pprint import pprint
@@ -48,7 +49,7 @@ from allocate_repair.batching import (
     validate_budget,
 )
 from allocate_repair.losses import LAMBDA_KEY, LOSS_AGG_MODE, PHASE_COUNT_KEYS, finalize_loss_metrics
-from allocate_repair.repair import AnswerExtractor, RepairPromptBuilder, build_repair_requests
+from allocate_repair.repair import AnswerExtractor, build_repair_requests, builder_from_config
 from allocate_repair.run_logging import RunLogger, software_versions
 
 AGENT_LOOP_NAME = "allocate_repair_agent"
@@ -87,12 +88,7 @@ class AllocateRepairTrainer(RayPPOTrainer):
             think_end=ar.repair.think_end,
             max_answer_tokens=int(ar.repair.max_previous_answer_tokens),
         )
-        self.prompt_builder = RepairPromptBuilder(
-            instruction=ar.repair.instruction,
-            prompt_format=ar.repair.prompt_format,
-            answer_header=ar.repair.answer_header,
-            failure_placeholder=ar.repair.extraction_failure_placeholder,
-        )
+        self.prompt_builder = builder_from_config(ar.repair)
         kwargs = self.config.data.get("apply_chat_template_kwargs", None)
         self.chat_template_kwargs = (
             OmegaConf.to_container(kwargs) if OmegaConf.is_config(kwargs) else dict(kwargs or {})
@@ -161,8 +157,9 @@ class AllocateRepairTrainer(RayPPOTrainer):
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
     # ------------------------------------------------------------------ rollout
-    def _rollout_two_phases(self, batch_dict: dict, metrics: dict, timing_raw: dict):
-        G, M = self.G, self.M
+    def _rollout_phase1(self, batch_dict: dict, timing_raw: dict) -> dict:
+        """Phase 1 (solve): G samples per question with their 0/1 rewards. Replicas stay awake afterwards."""
+        G = self.G
         batch = DataProto.from_single_dict(batch_dict)
         num_questions = len(batch)
         q_uids = _object_array([question_uid(self.global_steps, i) for i in range(num_questions)])
@@ -172,7 +169,6 @@ class AllocateRepairTrainer(RayPPOTrainer):
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch.non_tensor_batch["ar_phase"] = _object_array(["solve"] * num_questions)
 
-        # ---------------- phase 1: solve
         with marked_timer("gen_solve", timing_raw, color="red"):
             out1 = self._generate(gen_batch.repeat(repeat_times=G, interleave=True), timing_raw, "gen_solve")
         phase1 = batch.repeat(repeat_times=G, interleave=True).union(out1)
@@ -190,7 +186,13 @@ class AllocateRepairTrainer(RayPPOTrainer):
             }
         )
         r1 = self._rewards(phase1, "phase-1")
-        failed_rows = np.flatnonzero(r1 == 0.0).tolist()
+        return {"phase1": phase1, "traj1": traj1, "rows_q": rows_q, "question_messages": question_messages,
+                "r1": r1, "failed_rows": np.flatnonzero(r1 == 0.0).tolist(), "num_questions": num_questions}
+
+    def _rollout_two_phases(self, batch_dict: dict, metrics: dict, timing_raw: dict):
+        p1 = self._rollout_phase1(batch_dict, timing_raw)
+        phase1, traj1, rows_q, question_messages = p1["phase1"], p1["traj1"], p1["rows_q"], p1["question_messages"]
+        r1, failed_rows, M, num_questions = p1["r1"], p1["failed_rows"], self.M, p1["num_questions"]
 
         # ---------------- phase 2: explain and repair (same weights: replicas are still awake)
         phase2, requests, repair_stats = None, [], None
@@ -315,11 +317,25 @@ class AllocateRepairTrainer(RayPPOTrainer):
             filler.non_tensor_batch[key] = _object_array(["pad"] * pad)
         return DataProto.concat([batch, filler]), pad
 
+    def _compute_advantages(self, batch: DataProto, info: dict) -> DataProto:
+        """GRPO advantages with phase-specific group ids (``uid``)."""
+        batch.batch["token_level_scores"] = batch.batch["rm_scores"]
+        batch.batch["token_level_rewards"] = batch.batch["rm_scores"]
+        return compute_advantage(
+            batch,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+            config=self.config.algorithm,
+        )
+
+    def _phase2_temperature(self) -> float:
+        return float(self.ar.repair.temperature)
+
     def _set_temperature(self, batch: DataProto) -> None:
         if self.per_row_temperature:
             phase = batch.batch["ar_phase"]
             temp = torch.full(phase.shape, float(self.ar.solve.temperature), dtype=torch.float32)
-            temp[phase == PHASE_REPAIR] = float(self.ar.repair.temperature)
+            temp[phase == PHASE_REPAIR] = self._phase2_temperature()
             batch.batch["temperature"] = temp
             batch.meta_info.pop("temperature", None)
         else:
@@ -507,6 +523,53 @@ class AllocateRepairTrainer(RayPPOTrainer):
             examples.append(ex)
         return examples
 
+    # ------------------------------------------------------------------ full trajectory dump
+    PHASE2_NAME = "repair"
+
+    def _phase2_row_info(self, info: dict) -> list[dict]:
+        """Per-row fields of phase-2 rows for the trajectory dump (repair: the repair's 0/1 reward)."""
+        return [{"reward": float(x)} for x in info["r2"]]
+
+    def _dump_trajectories(self, info: dict) -> str | None:
+        """Every trajectory of this step -- exact prompt and full raw output (thinking included, special tokens kept)
+        -- to <allocate_repair.logging.trajectory_dir>/step_NNNNN.jsonl.gz. Off when trajectory_dir is null."""
+        out_dir = self.ar.logging.get("trajectory_dir", None)
+        if not out_dir:
+            return None
+        os.makedirs(out_dir, exist_ok=True)
+        parts = [("solve", info["phase1"], [{"reward": float(x)} for x in info["r1"]])]
+        if info["phase2"] is not None:
+            parts.append((self.PHASE2_NAME, info["phase2"], self._phase2_row_info(info)))
+        records = []
+        for phase, part, extras in parts:
+            prompts, responses = part.batch["prompts"], part.batch["responses"]
+            width = prompts.shape[1]
+            prompt_len, response_len = self._lengths(part)
+            trained = part.batch["response_mask"].sum(-1).tolist()
+            nt = part.non_tensor_batch
+            for j in range(len(part)):
+                p_ids = prompts[j, width - int(prompt_len[j]) :].tolist()  # prompts are left-padded
+                r_ids = responses[j, : int(response_len[j])].tolist()
+                extra_info = nt["extra_info"][j] if isinstance(nt["extra_info"][j], dict) else {}
+                reward_model = nt["reward_model"][j] if isinstance(nt["reward_model"][j], dict) else {}
+                records.append({
+                    "step": self.global_steps, "phase": phase,
+                    "traj_uid": str(nt["ar_traj_uid"][j]), "question_uid": str(nt["ar_question_uid"][j]),
+                    "parent_uid": str(nt["ar_parent_uid"][j]), "group_uid": str(nt["uid"][j]),
+                    "sample_index": int(nt["ar_sample_index"][j]), "question_id": extra_info.get("question_id"),
+                    "ground_truth": reward_model.get("ground_truth"),
+                    "prompt": self.tokenizer.decode(p_ids, skip_special_tokens=False),
+                    "response": self.tokenizer.decode(r_ids, skip_special_tokens=False),
+                    "prompt_tokens": len(p_ids), "response_tokens": len(r_ids), "trained_tokens": int(trained[j]),
+                    **extras[j],
+                })
+        path = os.path.join(out_dir, f"step_{self.global_steps:05d}.jsonl.gz")
+        with gzip.open(path + ".tmp", "wt", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+        os.replace(path + ".tmp", path)
+        return path
+
     # ------------------------------------------------------------------ checkpoint state
     def _ckpt_folder(self) -> str:
         root = self.config.trainer.default_local_dir
@@ -605,6 +668,8 @@ class AllocateRepairTrainer(RayPPOTrainer):
                 with marked_timer("step", timing_raw):
                     info = self._rollout_two_phases(batch_dict, metrics, timing_raw)
                     metrics.update(self._rollout_metrics(info))
+                    with marked_timer("dump_trajectories", timing_raw):
+                        self._dump_trajectories(info)
                     if examples_interval > 0 and (self.global_steps % examples_interval == 0 or self.global_steps == 1):
                         self.run_logger.log_examples(self.global_steps, self._examples(info))
 
@@ -613,14 +678,7 @@ class AllocateRepairTrainer(RayPPOTrainer):
                     num_repair = int((batch.batch["ar_phase"] == PHASE_REPAIR).sum())
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        batch.batch["token_level_scores"] = batch.batch["rm_scores"]
-                        batch.batch["token_level_rewards"] = batch.batch["rm_scores"]
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                            config=self.config.algorithm,
-                        )
+                        batch = self._compute_advantages(batch, info)
 
                     batch, _ = self._pad_for_dp(batch)
                     if self.config.trainer.balance_batch:

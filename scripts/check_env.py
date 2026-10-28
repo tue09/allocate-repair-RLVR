@@ -79,15 +79,17 @@ def math_verify():
     return "symbolic check ok"
 
 
-for mod in ("torch", "vllm", "transformers", "ray", "tensordict", "flash_attn", "verl", "wandb"):
-    check(mod, version(mod))
-check("cuda", cuda)
-check("flash-attn kernel", flash_attn_kernel)
-check("verl commit", verl_commit)
-check("allocate_repair", allocate_repair)
-check("math-verify (eval-only aux metric)", math_verify)
+# guard needed: verl's math_verify uses a "spawn" process pool, which re-imports this module in the child
+if __name__ == "__main__":
+    for mod in ("torch", "vllm", "transformers", "ray", "tensordict", "flash_attn", "verl", "wandb"):
+        check(mod, version(mod))
+    check("cuda", cuda)
+    check("flash-attn kernel", flash_attn_kernel)
+    check("verl commit", verl_commit)
+    check("allocate_repair", allocate_repair)
+    check("math-verify (eval-only aux metric)", math_verify)
 
-if failures:
-    print(f"\n{len(failures)} check(s) failed: {failures}")
-    sys.exit(1)
-print("\nenvironment looks good")
+    if failures:
+        print(f"\n{len(failures)} check(s) failed: {failures}")
+        sys.exit(1)
+    print("\nenvironment looks good")

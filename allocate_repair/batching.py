@@ -32,10 +32,16 @@ def repair_group_id(parent_traj_uid: str) -> str:
 
 
 def validate_budget(G: int, M: int) -> None:
+    """M=0: solve-only baseline. M>=2: GRPO within each failed parent's repair group.
+
+    M=1 is allowed but is not group-relative: each repair group has one sample, and verl's GRPO estimator gives a
+    single-sample group mean 0 and std 1, so a repair's advantage is its raw 0/1 reward (successful repairs are
+    reinforced, failed repairs get no gradient).
+    """
     if G < 2:
         raise ValueError(f"G (rollout.n) must be >= 2 for GRPO, got {G}")
-    if M != 0 and M < 2:
-        raise ValueError(f"M must be 0 (solve-only baseline) or >= 2 when repair training is enabled, got {M}")
+    if M < 0:
+        raise ValueError(f"M must be >= 0 (0 = solve-only baseline), got {M}")
 
 
 def generation_budget(num_failures_per_question: list[int], G: int, M: int) -> int:

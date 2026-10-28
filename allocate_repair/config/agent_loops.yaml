@@ -2,3 +2,8 @@
 # (actor_rollout_ref.rollout.agent.agent_loop_config_path).
 - name: allocate_repair_agent
   _target_: allocate_repair.agent_loop.PhaseAwareSingleTurnAgentLoop
+# plain single-turn rollout for DeepSeek-R1-Distill models (verl GRPO baseline): config.json says model_type "qwen2",
+# but the tokenizer uses DeepSeek chat tokens, so select verl's DeepSeek tokenization builder
+- name: r1_single_turn_agent
+  _target_: allocate_repair.agent_loop.TokenBuilderSingleTurnAgentLoop
+  token_builder_model_type: deepseek_v3

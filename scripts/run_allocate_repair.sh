@@ -5,8 +5,8 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-if (( M < 2 )); then
-    echo "M must be >= 2 for repair training (use scripts/run_solve_only.sh for M=0)" >&2
+if (( M < 1 )); then
+    echo "M must be >= 1 for repair training (use scripts/run_solve_only.sh for M=0; M=1 means advantage = reward, see allocate_repair/batching.py)" >&2
     exit 1
 fi
 EXP_NAME="${EXP_NAME:-ar_G${G}_M${M}_lam${LAMBDA}_bs${TRAIN_BATCH_SIZE}_$(date +%Y%m%d_%H%M%S)}"

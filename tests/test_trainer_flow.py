@@ -258,3 +258,15 @@ def test_combined_batch_feeds_the_loss(fake_tokenizer, M):
     loss.backward()
     assert torch.isfinite(loss) and log_probs.grad is not None
     assert metrics["ar/repair/num_seqs_x_dp"].aggregate() == nr
+
+
+def test_full_trajectory_dump_repair(fake_tokenizer, tmp_path):
+    import gzip
+    import json
+
+    trainer, _ = make_trainer(fake_tokenizer)
+    trainer.ar.logging.trajectory_dir = str(tmp_path)
+    info = trainer._rollout_two_phases(batch_dict(), {}, {})
+    rows = [json.loads(line) for line in gzip.open(trainer._dump_trajectories(info), "rt")]
+    assert [r["phase"] for r in rows].count("solve") == 12 and [r["phase"] for r in rows].count("repair") == 18
+    assert all(r["reward"] in (0.0, 1.0) and r["prompt"] and r["response"] for r in rows)

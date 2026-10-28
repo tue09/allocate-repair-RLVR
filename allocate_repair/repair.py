@@ -19,6 +19,24 @@ DEFAULT_ANSWER_HEADER = "Previous answer:"
 DEFAULT_FAILURE_PLACEHOLDER = "(The previous response ended without a final answer after its reasoning.)"
 TRUNCATION_MARKER = "[...] "
 
+# Prompt v3 (allocate_repair.repair.prompt_version=v3): no "reason step by step"; a wrong final answer must be repaired
+# in place (not re-solved) with an explicit reason section; a response without a final answer is asked to solve again,
+# more concisely. Chosen after the inference pilot in /cm/shared/tue09_new/analysis (repair_ablation report).
+V3_WRONG_ANSWER_INSTRUCTION = (
+    "The final answer above is incorrect. Do not solve the problem from scratch. You must repair the previous answer "
+    "itself: go through its steps in order, keep every step that is correct, find the step that is wrong, and correct "
+    "the solution from that step onward. Write your final response in this format:\n"
+    "# REASON WHY THE PREVIOUS ANSWER WAS WRONG:\n"
+    "<which step is wrong and why, in a few lines>\n"
+    "# CORRECTED SOLUTION:\n"
+    "<the corrected steps>\n"
+    'End with your corrected final answer on its own line in the form "Answer: $Answer".'
+)
+V3_NO_FINAL_ANSWER_INSTRUCTION = (
+    "The previous attempt ended before giving a final answer. Solve the problem again more concisely. "
+    'End with your final answer on its own line in the form "Answer: $Answer".'
+)
+
 
 @dataclass
 class ExtractionResult:
@@ -103,6 +121,9 @@ class RepairPromptBuilder:
 
     single_turn: the original user message is kept verbatim and followed by the previous answer and the feedback.
     multi_turn:  [original messages..., assistant: previous answer, user: feedback].
+
+    ``failure_instruction`` (optional) replaces ``instruction`` when no answer portion could be extracted from the
+    previous response (the failure placeholder is shown instead of an answer).
     """
 
     def __init__(
@@ -111,25 +132,40 @@ class RepairPromptBuilder:
         prompt_format: str = "single_turn",
         answer_header: str = DEFAULT_ANSWER_HEADER,
         failure_placeholder: str = DEFAULT_FAILURE_PLACEHOLDER,
+        failure_instruction: str | None = None,
     ):
         assert prompt_format in ("single_turn", "multi_turn"), f"unknown repair prompt format {prompt_format}"
         self.instruction = instruction
         self.prompt_format = prompt_format
         self.answer_header = answer_header
         self.failure_placeholder = failure_placeholder
+        self.failure_instruction = failure_instruction
 
-    def build(self, question_messages: list[dict], previous_answer: str) -> list[dict]:
+    def build(self, question_messages: list[dict], previous_answer: str, extraction_ok: bool = True) -> list[dict]:
         messages = [dict(m) for m in copy.deepcopy(list(question_messages))]
         assert messages and messages[-1]["role"] == "user", "the question must end with a user message"
+        instruction = self.instruction if extraction_ok else (self.failure_instruction or self.instruction)
         if self.prompt_format == "multi_turn":
             return messages + [
                 {"role": "assistant", "content": previous_answer},
-                {"role": "user", "content": self.instruction},
+                {"role": "user", "content": instruction},
             ]
-        messages[-1]["content"] = (
-            f"{messages[-1]['content']}\n\n{self.answer_header}\n{previous_answer}\n\n{self.instruction}"
-        )
+        messages[-1]["content"] = f"{messages[-1]['content']}\n\n{self.answer_header}\n{previous_answer}\n\n{instruction}"
         return messages
+
+
+def builder_from_config(repair_cfg) -> RepairPromptBuilder:
+    """RepairPromptBuilder for ``allocate_repair.repair``: prompt_version v1 (one instruction for every failed
+    response) or v3 (per-case instructions, see V3_* above)."""
+    version = str(repair_cfg.get("prompt_version", "v1"))
+    common = {"prompt_format": repair_cfg.prompt_format, "answer_header": repair_cfg.answer_header,
+              "failure_placeholder": repair_cfg.extraction_failure_placeholder}
+    if version == "v1":
+        return RepairPromptBuilder(instruction=repair_cfg.instruction, **common)
+    if version == "v3":
+        return RepairPromptBuilder(instruction=repair_cfg.v3.wrong_answer_instruction,
+                                   failure_instruction=repair_cfg.v3.no_final_answer_instruction, **common)
+    raise ValueError(f"unknown allocate_repair.repair.prompt_version {version!r} (v1 | v3)")
 
 
 def count_prompt_tokens(tokenizer, messages: list[dict], chat_template_kwargs: dict | None = None) -> int:
@@ -193,7 +229,7 @@ def build_repair_requests(
         else:
             answer = result.text
             stats["answer_truncated"] += int(result.truncated)
-        messages = builder.build(question_messages[row], answer)
+        messages = builder.build(question_messages[row], answer, extraction_ok=result.ok)
         n_tokens = count_prompt_tokens(tokenizer, messages, chat_template_kwargs)
         # Never let the rollout left-truncate the question: shorten the previous answer instead.
         if n_tokens > max_prompt_tokens and result.ok:
@@ -202,7 +238,7 @@ def build_repair_requests(
             while n_tokens > max_prompt_tokens and len(answer_ids) > 16:
                 answer_ids = answer_ids[len(answer_ids) // 4 :]
                 answer = TRUNCATION_MARKER + tokenizer.decode(answer_ids, skip_special_tokens=True).strip()
-                messages = builder.build(question_messages[row], answer)
+                messages = builder.build(question_messages[row], answer, extraction_ok=result.ok)
                 n_tokens = count_prompt_tokens(tokenizer, messages, chat_template_kwargs)
         if n_tokens > max_prompt_tokens:
             raise ValueError(

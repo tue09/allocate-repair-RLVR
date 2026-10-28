@@ -21,7 +21,7 @@ class FakeTokenizer:
     def get_vocab(self):
         return {"<pad>": 0, "<eos>": 1, "</think>": 2}
 
-    def encode(self, text):
+    def encode(self, text, add_special_tokens=False):
         ids, i = [], 0
         while i < len(text):
             if text.startswith("</think>", i):

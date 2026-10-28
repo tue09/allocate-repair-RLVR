@@ -10,13 +10,23 @@ defaults:
   - _self_
 
 allocate_repair:
-  # repairs per failed phase-1 response (0 = solve-only baseline; otherwise >= 2).
+  # phase 2: repair = explain-and-repair of failed responses; verify_depth = one depth-M verification chain for every
+  # solution (Scaling Verification Depth, see the `verify` section and allocate_repair/verify_depth.py);
+  # verify_depth_v2 = version 2 of the note (running conclusion, per-round fixed-baseline feedback)
+  method: repair
+  # repair: repairs per failed phase-1 response (0 = solve-only baseline). verify_depth: verification depth M (rounds of
+  # the one chain per solution, >= 1).
   # G is actor_rollout_ref.rollout.n.
   M: 4
-  # L_total = L_solve + repair_lambda * L_repair
+  # L_total = L_solve + repair_lambda * L_phase2 (L_repair or L_verify)
   repair_lambda: 1.0
   output_dir: ${trainer.default_local_dir}/allocate_repair_logs
   data_manifest: null
+  # model_type that verl uses to pick its Continuous Token builder (prompt tokenization in the agent loop).
+  # verl reads it from config.json, and R1-Distill-Qwen says "qwen2" -> Qwen builder, which needs <|im_end|>; but the
+  # R1-distill tokenizer uses DeepSeek chat tokens and has no <|im_end|>. "deepseek_v3" selects verl's DeepSeek builder
+  # (renders exactly the model's own chat template). null = use config.json (right for genuine Qwen chat models).
+  token_builder_model_type: deepseek_v3
 
   # per-phase decoding settings; max_tokens is the per-phase generation limit
   solve:
@@ -33,14 +43,91 @@ allocate_repair:
     max_previous_answer_tokens: 1024
     prompt_format: single_turn   # single_turn | multi_turn
     answer_header: "Previous answer:"
+    # v1: `instruction` for every failed response (the original prompt).
+    # v3: v3.wrong_answer_instruction when an answer was extracted from the failed response, otherwise
+    #     v3.no_final_answer_instruction (no "reason step by step"; repair in place with a reason section).
+    prompt_version: v3
     instruction: >-
       The previous answer to this question is incorrect. Explain why it is incorrect and solve the problem again.
       End with your corrected final answer on its own line in the form "Answer: $Answer".
+    v3:
+      wrong_answer_instruction: |-
+        The final answer above is incorrect. Do not solve the problem from scratch. You must repair the previous answer itself: go through its steps in order, keep every step that is correct, find the step that is wrong, and correct the solution from that step onward. Write your final response in this format:
+        # REASON WHY THE PREVIOUS ANSWER WAS WRONG:
+        <which step is wrong and why, in a few lines>
+        # CORRECTED SOLUTION:
+        <the corrected steps>
+        End with your corrected final answer on its own line in the form "Answer: $Answer".
+      no_final_answer_instruction: >-
+        The previous attempt ended before giving a final answer. Solve the problem again more concisely.
+        End with your final answer on its own line in the form "Answer: $Answer".
     extraction_mode: auto        # auto | think | full
     think_end: "</think>"
     # what to show when no answer can be extracted after the think block: placeholder | skip (no repair)
     extraction_failure_policy: placeholder
     extraction_failure_placeholder: "(The previous response ended without a final answer after its reasoning.)"
+  # method=verify_depth: one chain of M (allocate_repair.M) rounds for every solution; chain advantages are normalized
+  # over the chains of one question. Round d shows the question,
+  # the solution's text after </think> (capped by repair.max_previous_answer_tokens, tail kept) and the text after
+  # </think> of rounds 1..d-1 (each capped by max_round_tokens); never the reference answer or any reasoning.
+  verify:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 8192
+    max_round_tokens: 512
+    # absolute: every round judges the solution (later_round_instruction_absolute), converted to the note's relative
+    #           verdicts; same depth reward when every verdict is present. relative: the note's literal prompts.
+    judgment: absolute
+    # a round whose text after </think> has no verdict gets "<forced_verdict_text>" appended (after a forced </think>
+    # if it never closed its thinking) and the model writes the verdict in up to verdict_reserve_tokens more tokens;
+    # the forced text is masked out of the loss. The first generation stops verdict_reserve_tokens early.
+    forced_verdict: true
+    verdict_reserve_tokens: 16
+    forced_verdict_text: "\n\n**Verdict (CORRECT or INCORRECT):**"
+    # per-round score +1/k (verdict right), 0 (own verdict, wrong), -1/k (format violation: no parseable verdict
+    # written by the policy itself, i.e. missing or only after the forced header); false: the note's 1/k or 0
+    format_penalty: true
+    # solutions without a final-response section (no </think>, e.g. truncated): skip (not verified) | placeholder
+    unextractable_solution_policy: skip
+    no_solution_text: "(The solution ended without a final answer.)"
+    round_failure_text: "(This verification round ended without a final response.)"
+    question_header: "Question:"
+    solution_header: "Proposed solution:"
+    round_header: "Verification round {d}:"
+    round1_instruction: |-
+      Check whether the proposed solution above is correct: verify its steps and whether its final answer correctly answers the question. Do not solve the problem from scratch. Write a short analysis, then end with exactly one line:
+      Verdict: CORRECT
+      or
+      Verdict: INCORRECT
+    later_round_instruction: |-
+      The verification rounds above may contain mistakes. Check whether the verdict of verification round {prev} is right, i.e. whether its conclusion about the proposed solution is correct. Write a short analysis, then end with exactly one line:
+      Verdict: CORRECT (the verdict of round {prev} is right)
+      or
+      Verdict: INCORRECT (the verdict of round {prev} is wrong)
+    later_round_instruction_absolute: |-
+      The verification rounds above may contain mistakes. Taking them into account, check again whether the proposed solution is correct. Do not solve the problem from scratch. Write a short analysis, then end with exactly one line:
+      Verdict: CORRECT (the proposed solution is correct)
+      or
+      Verdict: INCORRECT (the proposed solution is wrong)
+    # ---- method=verify_depth_v2 (version 2 of the note): round d >= 2 sees the question, the solution and only the
+    # previous round's forwarded final answer A_{d-1} = (its text after </think>, running conclusion c_{d-1}); every
+    # round is its own example with reward 1[v_d = v*_d] and advantage reward - advantage_baseline. judgment, the
+    # round_header and the chain-level advantages above are version 1 only.
+    previous_round_header: "Previous verification round:"
+    conclusion_text: "Running conclusion: the proposed solution is {conclusion}."
+    conclusion_correct: CORRECT
+    conclusion_incorrect: INCORRECT
+    conclusion_unknown: "unknown (an earlier verification round gave no verdict)"
+    later_round_instruction_v2: |-
+      The previous verification round above may contain mistakes. Check whether its verdict is right, i.e. whether the running conclusion about the proposed solution is correct. Write a short analysis, then end with exactly one line:
+      Verdict: CORRECT (the previous verdict is right)
+      or
+      Verdict: INCORRECT (the previous verdict is wrong)
+    # format reward of a round with a format violation (with format_penalty): null = -1/M
+    format_penalty_reward: null
+    # eq. (13): fixed baseline (advantage = round reward - 1/2)
+    advantage_baseline: 0.5
   # held-out evaluation is first-attempt only (original question; sampling from rollout.val_kwargs)
   validation:
     max_tokens: ${allocate_repair.solve.max_tokens}
@@ -49,6 +136,8 @@ allocate_repair:
     examples_interval: 10      # dump examples every N steps (and at step 1); 0 disables
     examples_num_questions: 2
     examples_max_chars: 20000
+    # every trajectory of every step (exact prompt + full raw output) -> <dir>/step_NNNNN.jsonl.gz; null = off
+    trajectory_dir: null
   wandb:
     mode: offline
     dir: ${trainer.default_local_dir}/wandb

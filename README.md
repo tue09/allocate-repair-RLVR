@@ -1,176 +1,431 @@
-# allocate-repair RLVR
+<div align="center">
 
-Two-phase GRPO on [verl](https://github.com/verl-project/verl) (pinned to **v0.9.1**, commit `1876b06`):
+# Scaling Verification Depth for Stronger Reasoning
 
-1. **Solve**: sample G responses per question, score with a binary 0/1 reward.
-2. **Explain and repair**: for every incorrect response, show the model the question, its previous final answer
-   (reasoning inside the think block removed) and "this answer is incorrect", then sample M repairs.
-3. **One update**: GRPO advantages per phase (question groups / failed-parent groups) and a single optimizer step
-   on `L_total = L_solve + λ · L_repair`.
+**Don't just sample more solutions. Learn more from each one.**
 
-Defaults: DeepSeek-R1-Distill-Qwen-1.5B, DAPO-Math-17k, 4× A100-40GB (GPUs 0–3), W&B offline.
-The full method spec is in [allocate-repair-prompt.md](allocate-repair-prompt.md).
+A two-phase RLVR recipe in which the policy verifies every solution it writes,<br>
+then verifies its own verdicts, round after round.
 
-## Quick start on the server
+<p>
+<img src="https://img.shields.io/badge/RLVR-GRPO%20%2B%20verification%20depth-3A6EA5?style=flat-square" alt="RLVR">
+<img src="https://img.shields.io/badge/built%20on-verl%20v0.9.1-6C8EBF?style=flat-square" alt="verl v0.9.1">
+<img src="https://img.shields.io/badge/rollout-vLLM%200.24-5B9F6E?style=flat-square" alt="vLLM 0.24">
+<img src="https://img.shields.io/badge/model-Qwen3--1.7B-C9A227?style=flat-square" alt="Qwen3-1.7B">
+<img src="https://img.shields.io/badge/data-DAPO--Math--17k-C0605A?style=flat-square" alt="DAPO-Math-17k">
+<img src="https://img.shields.io/badge/python-3.12-2C3E50?style=flat-square&logo=python&logoColor=white" alt="Python 3.12">
+</p>
 
-Copy this whole folder (it includes the prepared data and the pinned verl checkout) to the server, then:
+<p>
+<a href="#highlights">Highlights</a> &nbsp;•&nbsp;
+<a href="#motivation">Motivation</a> &nbsp;•&nbsp;
+<a href="#method">Method</a> &nbsp;•&nbsp;
+<a href="#quick-start">Quick start</a> &nbsp;•&nbsp;
+<a href="#configuration">Configuration</a> &nbsp;•&nbsp;
+<a href="#citation">Citation</a>
+</p>
 
-```bash
-cd /cm/shared/tue09_new/allocate_repair_RLVR   # wherever you copied it
+<img src="assets/teaser.png" width="96%" alt="Scaling rollout width versus scaling verification depth">
 
-bash scripts/setup_env.sh            # once, on the GPU node: creates conda env "arrlvr" (~10-40 min)
-bash scripts/run_unit_tests.sh       # CPU checks (~1 min)
-bash scripts/run_smoke_test.sh       # 4-step end-to-end run on GPUs 0-3 (~15-30 min)
+<sub><b>Two ways to spend extra training compute on a hard question.</b> (a) Scaling rollout width samples more solutions,
+but if all of them fail, every reward is 0 and the group-relative advantages vanish. (b) Scaling verification depth
+verifies each existing solution over several rounds, each judging the previous verdict.</sub>
 
-bash scripts/run_solve_only.sh       # baseline:  G=8, M=0
-bash scripts/run_allocate_repair.sh  # method:    G=8, M=4, lambda=1.0
+</div>
+
+<br>
+
+<a id="highlights"></a>
+
+## ✨ Highlights
+
+- 🔁 **A new scaling axis.** Extra compute goes into *verification depth*, a chain of rounds that reassess earlier
+  judgments, instead of ever wider rollouts.
+- 🎯 **Signal where GRPO has none.** Every round ends in a verifiable decision, so a question whose solutions all fail
+  still produces learning signal.
+- 🪞 **Self-correction by design.** Later rounds judge earlier verdicts. The model learns to catch its own misjudgments
+  and to keep the assessments that were right.
+- 🧩 **One policy, one update.** Solutions and verification rounds come from the same policy snapshot and are optimized
+  together: $`\mathcal J = \mathcal J_{\mathrm{GRPO}} + \mathcal J_{\mathrm{verify}}`$.
+
+<a id="motivation"></a>
+
+## 💡 Motivation
+
+Recent work on reinforcement learning with verifiable rewards (RLVR) improves training efficiency by scaling the number
+of generated solutions. [VIP](https://proceedings.iclr.cc/paper_files/paper/2026/hash/dc62cd4ec77f3bbec8e6245d0bd91d08-Abstract-Conference.html)
+and [DARS](https://proceedings.mlr.press/v306/yang26s.html) adaptively allocate rollout budgets across questions to
+explore difficult problems better. Scaling rollout width has an inherent limit, though: more solutions do not
+necessarily mean more useful signal. On a hard question, extra rollouts can all fail, the rewards stay uniformly zero,
+and the group-relative advantages vanish. These approaches also spend the extra computation on exploring new
+solutions and leave unused the signal hidden in attempts that were already generated.
+
+> [!NOTE]
+> **The question we ask:** rather than continuously generating more solutions, can we improve reasoning by learning
+> more deeply from each existing solution?
+
+We propose an alternative scaling direction, **verification depth**. The model goes through a sequence of verification
+rounds, each reassessing its previous judgment. Every round produces a verifiable decision, so the model gets learning
+signal even when the original solution is wrong. The recursion teaches the model to identify incorrect solutions,
+to recognize mistakes in its own judgments, and to preserve correct assessments. We hypothesize that, under a
+comparable training budget, this improves reasoning more efficiently than simply widening the rollouts.
+
+<a id="method"></a>
+
+## 🧠 Method
+
+### Two rollout phases
+
+Each training step has two rollout phases. **Phase 1** is the standard GRPO rollout: the policy samples $`G`$
+solutions to a question. **Phase 2** scales verification in depth: the policy generates one verification chain of
+$`M`$ sequential rounds for each solution, where $`M`$ is the *verification depth*. Both phases sample from
+$`\pi_{\theta_{\mathrm{old}}}`$ and are optimized in the same update. Every verification round is a separate
+prompt-response example with its own correctness reward.
+
+<p align="center">
+  <img src="assets/verification_chain.png" width="96%" alt="Phase 1 samples G solutions; phase 2 verifies each solution over M rounds">
+</p>
+
+<p align="center"><sub>
+Phase 1 samples <i>G</i> solutions to <i>Q</i>. Phase 2 generates one verification chain of depth <i>M</i> for each
+<i>S<sub>i</sub></i> (here <i>M</i> = 4, and <i>S<sub>i</sub></i> is incorrect). Blue: policy verdicts;
+<i>v</i><sub>1</sub> judges <i>S<sub>i</sub></i>, and each <i>v<sub>d</sub></i> judges <i>v</i><sub><i>d</i>−1</sub>.
+Yellow: target verdicts. Each match (✓/✗) determines the next target and supplies the current round's reward.
+</sub></p>
+
+### Phase 1 · Solution generation
+
+For each question $`Q`$ with reference answer $`R`$, the policy samples $`\{S_i\}_{i=1}^{G} \sim \pi_{\theta_{\mathrm{old}}}(\cdot \mid Q)`$.
+A rule-based verifier assigns each solution a binary outcome reward $`r_i = \operatorname{Verify}(S_i, R) \in \{0, 1\}`$,
+and the solutions are trained with GRPO's group-normalized advantage:
+
+```math
+\hat A_{i,t}=\frac{r_i-\operatorname{mean}\big(\{r_j\}_{j=1}^{G}\big)}{\operatorname{std}\big(\{r_j\}_{j=1}^{G}\big)} .
 ```
 
-The run scripts activate `arrlvr` themselves, use `CUDA_VISIBLE_DEVICES=0,1,2,3`, and read the model from
-`/cm/archive/tue09/model_hub/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`. Change anything with environment variables
-or extra Hydra overrides:
+<details>
+<summary><b>The GRPO objective</b></summary>
 
-```bash
-M=8 LAMBDA=0.5 TRAIN_BATCH_SIZE=32 bash scripts/run_allocate_repair.sh trainer.total_training_steps=200
-MODEL_PATH=/path/to/other/model bash scripts/run_smoke_test.sh
+```math
+\mathcal J_{\mathrm{GRPO}}(\theta)=\mathbb E\Bigg[\frac{1}{G}\sum_{i=1}^{G}\frac{1}{|o_i|}\sum_{t=1}^{|o_i|}\Big(\min\big(\rho_{i,t}(\theta)\hat A_{i,t},\ \operatorname{clip}\big(\rho_{i,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A_{i,t}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
+\qquad
+\rho_{i,t}(\theta)=\frac{\pi_\theta(o_{i,t}\mid Q,o_{i,<t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t}\mid Q,o_{i,<t})}
 ```
 
-Long runs: start them inside `tmux`/`screen` (or `nohup ... &`); everything is also written to `outputs/<exp>/train.log`.
+with $`o_i = S_i`$, clipping range $`\varepsilon`$, and KL weight $`\beta`$ toward a frozen reference policy $`\pi_{\mathrm{ref}}`$.
 
-If you clone from GitHub instead of copying the folder, the data is not in git:
+</details>
+
+### Phase 2 · Verification chain
+
+For each solution $`S`$, the policy generates one chain of $`M`$ rounds. Round 1 sees the question and the solution;
+every later round additionally sees **only the previous round's final answer**:
+
+```math
+x_d=\begin{cases}(Q,\,S), & d=1,\\[2pt](Q,\,S,\,A_{d-1}), & d=2,\ldots,M,\end{cases}
+\qquad
+V_d\sim\pi_{\theta_{\mathrm{old}}}(\cdot\mid x_d),
+\qquad
+\bar A_d=\operatorname{ExtractAnswer}(V_d).
+```
+
+$`\bar A_d`$ is the final answer after the closing `</think>` tag and contains a binary verdict $`v_d`$. The reasoning
+inside `<think>` is never passed to later rounds.
+
+| Round | Sees | Verdict $`v_d = 1`$ claims |
+|:---:|:---|:---|
+| $`d = 1`$ | question $`Q`$, solution $`S`$ | the solution $`S`$ is correct |
+| $`d \ge 2`$ | $`Q`$, $`S`$, previous final answer $`A_{d-1}`$ | the previous verdict $`v_{d-1}`$ is correct |
+
+To keep each forwarded answer self-contained, a **running conclusion** about whether $`S`$ is correct is attached to it:
+
+```math
+c_1=v_1,
+\qquad
+c_d=\begin{cases}c_{d-1}, & v_d=1,\\ 1-c_{d-1}, & v_d=0,\end{cases}
+\qquad
+A_d=(\bar A_d,\ c_d).
+```
+
+The conclusion is computed deterministically from the sampled verdicts, without the reference answer. It summarizes the
+verdict history without carrying any earlier reasoning trace. The policy chain is $`C_M=(v_1,\ldots,v_M)`$.
+
+### Target chain and round reward
+
+The **target chain** $`C_M^\star=(v_1^\star,\ldots,v_M^\star)`$ holds the correct verdict at every depth. It starts
+from the phase-1 outcome, and each later target records whether the policy was right one depth earlier:
+
+```math
+v_1^\star=\operatorname{Verify}(S,R),
+\qquad
+v_d^\star=\mathbf 1\big[v_{d-1}=v_{d-1}^\star\big],
+\quad d=2,\ldots,M.
+```
+
+The target chain is built after the policy chain is generated and is never shown to the policy. Each round receives
+its own binary correctness reward. Equivalently, a verdict is correct exactly when its running conclusion agrees with
+the solution's outcome:
+
+```math
+r_d^{\mathrm{verify}}=\mathbf 1\big[v_d=v_d^\star\big]=\mathbf 1\big[c_d=\operatorname{Verify}(S,R)\big]\in\{0,1\}.
+```
+
+<details open>
+<summary><b>Worked example</b>: the chain from the figure above (<i>M</i> = 4, incorrect solution, Verify(<i>S</i>, <i>R</i>) = 0)</summary>
+<br>
+
+| depth $`d`$ | 1 | 2 | 3 | 4 |
+|:---|:---:|:---:|:---:|:---:|
+| policy verdict $`v_d`$ | 1 | 0 | 1 | 0 |
+| running conclusion $`c_d`$ | 1 | 0 | 0 | 1 |
+| target verdict $`v_d^\star`$ | 0 | 0 | 1 | 1 |
+| round reward $`r_d^{\mathrm{verify}}`$ | ✗ 0 | ✓ 1 | ✓ 1 | ✗ 0 |
+| feedback $`\hat A_d^{\mathrm{verify}} = r_d - \tfrac12`$ | −½ | +½ | +½ | −½ |
+
+Round 1 wrongly accepts the solution. Round 2 correctly rejects that verdict. Round 3 correctly keeps round 2's
+verdict. Round 4 wrongly overturns it. The summary score
+$`r^{(M)}_{\mathrm{verify}} = \frac1M \sum_d r_d^{\mathrm{verify}} = \frac24`$ is kept for monitoring only: training uses
+the individual round rewards.
+
+</details>
+
+### Training objective
+
+Each pair $`(x_{i,d}, V_{i,d})`$ is a separate training example whose sampled context is held fixed during the update.
+Its feedback uses a **fixed baseline** of ½, rewarding correct rounds and penalizing incorrect ones without comparing
+different branches or depths:
+
+```math
+\hat A^{\mathrm{verify}}_{i,d}=r^{\mathrm{verify}}_{i,d}-\tfrac12=\begin{cases}+\tfrac12, & v_{i,d}=v^\star_{i,d},\\ -\tfrac12, & v_{i,d}\neq v^\star_{i,d}.\end{cases}
+```
+
+Phase 2 is then trained with the round-level clipped policy-gradient objective
+
+```math
+\mathcal J_{\mathrm{verify}}(\theta)=\mathbb E\Bigg[\frac{1}{GM}\sum_{i=1}^{G}\sum_{d=1}^{M}\frac{1}{|V_{i,d}|}\sum_{t=1}^{|V_{i,d}|}\Big(\min\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta)\hat A^{\mathrm{verify}}_{i,d},\ \operatorname{clip}\big(\rho^{\mathrm{verify}}_{i,d,t}(\theta),1-\varepsilon,1+\varepsilon\big)\hat A^{\mathrm{verify}}_{i,d}\big)-\beta\,\mathbb D_{\mathrm{KL}}\big[\pi_\theta\,\|\,\pi_{\mathrm{ref}}\big]\Big)\Bigg],
+```
+
+where $`\rho^{\mathrm{verify}}_{i,d,t}(\theta)=\pi_\theta(V_{i,d,t}\mid x_{i,d},V_{i,d,<t})\,/\,\pi_{\theta_{\mathrm{old}}}(V_{i,d,t}\mid x_{i,d},V_{i,d,<t})`$,
+and the policy maximizes
+
+```math
+\boxed{\;\mathcal J(\theta)=\mathcal J_{\mathrm{GRPO}}(\theta)+\mathcal J_{\mathrm{verify}}(\theta)\;}
+```
+
+**Design choices**
+
+- 🧱 **Round-level credit.** Each round is trained for its own verdict accuracy. Rewards of later rounds are never
+  credited to earlier responses, and the chain is never concatenated into a single training response.
+- 🎭 **What is trained.** A round's feedback is shared by all of its generated tokens, reasoning and final answer.
+  The question, the solution, the previous final answer and the round instructions are masked. The deterministic
+  conclusion field is not generated by the policy and gets no loss.
+- ⚖️ **What is rewarded.** Rewards score binary verdicts, not the validity of the reasoning that leads to them.
+- 📈 **Cost.** Phase 2 adds $`G \times M`$ verification rounds, and as many training examples, per question.
+
+<details>
+<summary><b>What a verification round sees</b> (prompt templates)</summary>
+<br>
+
+**Round 1**
+
+```text
+Question:
+{question Q}
+
+Proposed solution:
+{solution S}
+
+Check whether the proposed solution above is correct: verify its steps and whether its final answer correctly
+answers the question. Do not solve the problem from scratch. Write a short analysis, then end with exactly one line:
+Verdict: CORRECT
+or
+Verdict: INCORRECT
+```
+
+**Round d ≥ 2**
+
+```text
+Question:
+{question Q}
+
+Proposed solution:
+{solution S}
+
+Previous verification round:
+{final answer of round d-1, the text after </think>}
+
+Running conclusion: the proposed solution is {CORRECT | INCORRECT}.
+
+The previous verification round above may contain mistakes. Check whether its verdict is right, i.e. whether the
+running conclusion about the proposed solution is correct. Write a short analysis, then end with exactly one line:
+Verdict: CORRECT (the previous verdict is right)
+or
+Verdict: INCORRECT (the previous verdict is wrong)
+```
+
+</details>
+
+<a id="quick-start"></a>
+
+## 🚀 Quick start
+
+> [!TIP]
+> Reference setup: **4× NVIDIA A100 (40 GB)**, **Qwen3-1.7B** in thinking mode, **DAPO-Math-17k**.
 
 ```bash
+# 0 · clone (verl v0.9.1 is pinned as a submodule)
 git clone --recursive https://github.com/tue09/allocate-repair-RLVR.git
-cd allocate-repair-RLVR && bash scripts/setup_env.sh && conda activate arrlvr
-HF_HUB_OFFLINE=0 bash scripts/download_data.sh   # needs huggingface.co access
+cd allocate-repair-RLVR
+
+# 1 · environment: conda env "arrlvr"  (torch 2.11 · vLLM 0.24 · flash-attn 2.8.3 · verl 0.9.1)
+bash scripts/setup_env.sh
+conda activate arrlvr
+
+# 2 · data: DAPO-Math-17k (deduplicated + held-out split), AIME 2024, AIME 2025, MATH-500
+HF_HUB_OFFLINE=0 bash scripts/download_data.sh
+
+# 3 · train: G = 4 solutions per question, verification depth M = 3
+MODEL_PATH=/path/to/Qwen3-1.7B bash scripts/train_verify_depth_v2_qwen3_dapo.sh
 ```
 
-## Environment
+More ways to launch:
 
-`scripts/setup_env.sh` reads the NVIDIA driver version (shown in the `nvidia-smi` header) and picks a build:
+```bash
+G=8 M=5 bash scripts/train_verify_depth_v2_qwen3_dapo.sh          # wider and deeper
+DRY_RUN=1 bash scripts/train_verify_depth_v2_qwen3_dapo.sh        # print the resolved config, no training
+EXP_NAME=<run> bash scripts/train_verify_depth_v2_qwen3_dapo.sh   # resume a run from its latest checkpoint
+bash scripts/train_verify_depth_v2_qwen3_dapo.sh trainer.save_freq=50   # append any Hydra override
+```
 
-| driver | variant | what gets installed |
-|---|---|---|
-| ≥ 580 | `cu130` | verl's tested stack: torch 2.11.0+cu130, vLLM 0.24.0, prebuilt flash-attn 2.8.3 (verl wheelhouse). No compiling. |
-| 525–579 | `cu129` | torch 2.11.0+cu129, vLLM 0.24.0+cu129 release wheel, flash-attn 2.8.3 built from source for sm80 (~10–30 min; nvcc 12.9 from conda unless `CUDA_HOME` has nvcc 12.x). |
+> [!IMPORTANT]
+> A default run is 250 steps, so start it inside `tmux`. Output paths default to our cluster layout: set
+> `MODEL_PATH`, `CKPT_ROOT` and `TRAJECTORY_DIR` for your machine. Results are mirrored to a Hugging Face dataset
+> repo while training; set `HF_SYNC=0` to turn that off, or `HF_REPO=<user>/<repo>` to redirect it.
 
-Force a variant with `CUDA_VARIANT=cu129 bash scripts/setup_env.sh`. Every other package is pinned to verl's
-`uv.lock` through `requirements/constraints-common.txt` (regenerate with `scripts/make_constraints.py`). The script
-ends with `python scripts/check_env.py`, which verifies versions, the GPUs, a flash-attn kernel and the verl commit.
-Run setup on a GPU node; on a login node without GPUs the final CUDA check fails.
+<details>
+<summary><b>Environment details</b></summary>
+<br>
 
-## Data (included under `data/`, git-ignored)
+`scripts/setup_env.sh` reads the NVIDIA driver version and installs a matching build into a conda env (Python 3.12):
 
-`scripts/prepare_data.py` downloads pinned dataset revisions and writes `data/processed/` plus `manifest.json`
-(revisions, file hashes, counts, policies).
+| Driver | Build | Installed |
+|:---:|:---:|:---|
+| ≥ 580 | `cu130` | torch 2.11.0, vLLM 0.24.0 and flash-attn 2.8.3, all prebuilt |
+| 525 – 579 | `cu129` | torch 2.11.0 + vLLM 0.24.0 CUDA 12.9 wheels; flash-attn compiled for A100 (sm80) |
 
-| file | rows | source |
-|---|---|---|
-| `train.parquet` | 16,373 | DAPO-Math-17k @ `6587709` |
-| `val_dapo_heldout.parquet` | 500 | DAPO-Math-17k, held out |
-| `eval_aime24.parquet` | 30 | BytedTsinghua-SIA/AIME-2024 @ `aa49075` |
-| `eval_aime25.parquet` | 30 | MathArena/aime_2025 @ `c94da77` |
-| `eval_math500.parquet` | 500 | HuggingFaceH4/MATH-500 @ `6e4ed1a` |
-| `smoke_train.parquet` / `smoke_val.parquet` | 64 / 24 | subsets for the smoke test |
+All other packages are pinned to verl's lock file (`requirements/constraints-common.txt`). The script ends with
+`scripts/check_env.py`, which checks versions, GPUs, a flash-attn kernel and the verl commit.
 
-How duplicates in DAPO-Math-17k are handled:
-- 1,791,700 raw rows = 17,917 question ids × exactly 100 copies. The copies are collapsed.
-- 17,398 unique question texts remain, or 16,901 after normalization (NFKC, lower-case, whitespace removed).
-- 1,001 ids duplicate another id's normalized question and are merged.
-- 15 normalized groups (30 ids) have ground truths that disagree; these groups are dropped.
-- 5 questions overlapping MATH-500 and 8 prompts over 1,024 tokens are removed.
-- The held-out split is drawn at the normalized-question level, so it is disjoint from train by construction.
+</details>
 
-All prompts use the DAPO answer format (`Answer: $Answer`). Training and evaluation are both scored by verl's
-`math_dapo` checker.
+<details>
+<summary><b>Data details</b></summary>
+<br>
 
-## What one training step does
+| Split | Questions | Source |
+|:---|---:|:---|
+| train | 16,373 | DAPO-Math-17k |
+| held-out validation | 500 | DAPO-Math-17k, disjoint from train |
+| AIME 2024 / AIME 2025 | 30 / 30 | competition problems |
+| MATH-500 | 500 | MATH test subset |
 
-| step | where |
-|---|---|
-| Phase 1: G samples per question via verl's agent loop / vLLM; 0/1 reward streamed by verl's reward loop | `trainer.py::_rollout_two_phases`, `reward_fn.py` |
-| Answer extraction after the last `</think>` (token id from the tokenizer); a response without it is an *extraction failure* (logged, placeholder text shown, never the reasoning) | `repair.py::AnswerExtractor` |
-| Repair prompt = original user message verbatim + previous answer + feedback; built without access to the ground truth or other responses | `repair.py::RepairPromptBuilder`, `build_repair_requests` |
-| Phase 2: M samples per failed response, generated **before** the vLLM replicas sleep (same weights as phase 1) | `trainer.py::_rollout_two_phases` |
-| Advantages: verl's GRPO estimator (unbiased std, ε=1e-6) with group ids `solve::<question>` and `repair::<parent response>`; identical-reward groups get 0 | `trainer.py::fit`, `batching.py` |
-| old log-probs (and optional ref log-probs) recomputed by the FSDP actor under each trajectory's own prompt | verl `_compute_old_log_prob` |
-| Loss: verl's clipped policy loss, `seq-mean-token-mean` within each phase, normalized by the *global* phase trajectory count; `L_solve + λ·L_repair`; optional KL once per phase; one mini-batch = one optimizer step | `losses.py`, `workers.py`, `trainer.py::_update_actor_two_phase` |
+DAPO-Math-17k ships 1.79M rows: 17,917 questions repeated 100 times each. We collapse the copies, merge
+near-duplicate questions (normalized text), drop questions with conflicting reference answers, and remove questions
+that overlap the evaluation sets. All prompts use the same answer format and the same rule-based verifier.
+Evaluation measures first-attempt accuracy from the question alone.
 
-The integration subclasses verl's `RayPPOTrainer` (the legacy single-controller path, `trainer.use_v1=false`). The
-v1 trainer streams prompts through a TransferQueue replay buffer, which does not fit a second generation phase that
-depends on the first. verl's rollout, agent loop, reward loop, advantage estimator, policy loss, FSDP engine,
-checkpointing and tracking are reused unchanged. The only additions are the worker subclass that installs the
-phase-weighted loss and a small agent loop that applies per-phase sampling settings.
+</details>
 
-## Configuration
+<a id="configuration"></a>
 
-Main knobs (environment variables in `scripts/common.sh`, defaults in brackets):
+## ⚙️ Configuration
 
-| variable | meaning |
-|---|---|
-| `G` [8], `M` [4], `LAMBDA` [1.0] | samples per question, repairs per failed response (0 = solve-only), repair loss weight |
-| `TRAIN_BATCH_SIZE` [64], `LR` [1e-6], `SEED` [42] | questions per optimizer step, learning rate, seed |
-| `SOLVE_MAX_TOKENS` / `REPAIR_MAX_TOKENS` / `VAL_MAX_TOKENS` [8192] | per-phase generation limits |
-| `SOLVE_TEMPERATURE`, `SOLVE_TOP_P`, `REPAIR_TEMPERATURE`, `REPAIR_TOP_P` [1.0] | per-phase sampling |
-| `MAX_PREV_ANSWER_TOKENS` [1024], `ROLLOUT_PROMPT_LENGTH` [2560] | previous-answer cap in the repair prompt (tail kept), prompt budget |
-| `VAL_N` [4], `VAL_TEMPERATURE` [0.6], `VAL_TOP_P` [0.95] | evaluation sampling (first attempt only) |
-| `TEST_FREQ` [10], `SAVE_FREQ` [50], `TOTAL_EPOCHS` [1], `TOTAL_STEPS` | evaluation / checkpoint interval, run length |
-| `MODEL_PATH`, `DATA_DIR`, `OUTPUT_ROOT`, `CUDA_VISIBLE_DEVICES` | paths and GPUs |
-| `ROLLOUT_GPU_MEM_UTIL` [0.6], `OPTIMIZER_OFFLOAD`, `PARAM_OFFLOAD` [False] | memory |
+The main knobs of `scripts/train_verify_depth_v2_qwen3_dapo.sh` are environment variables:
 
-Everything else (repair prompt format and wording, extraction mode, failure policy, KL, clipping, …) is in
-`allocate_repair/config/allocate_repair_trainer.yaml` and can be overridden on the command line, e.g.
-`allocate_repair.repair.prompt_format=multi_turn` or `actor_rollout_ref.actor.use_kl_loss=true`.
+| Variable | Default | Meaning |
+|:---|:---:|:---|
+| `G` | 4 | solutions per question (phase 1, GRPO group size) |
+| `M` | 3 | verification depth: rounds in the chain of each solution |
+| `TRAIN_BATCH_SIZE` | 64 | questions per optimizer step |
+| `TOTAL_STEPS` | 250 | training steps (about one epoch) |
+| `LR` | 1e-6 | AdamW learning rate |
+| `ADVANTAGE_BASELINE` | 0.5 | fixed baseline $`b`$ in $`\hat A_d^{\mathrm{verify}} = r_d^{\mathrm{verify}} - b`$ |
+| `USE_KL_LOSS` · `KL_LOSS_COEF` | False · 0.001 | KL penalty $`\beta`$ toward the reference policy |
+| `SOLVE_MAX_TOKENS` | 8192 | generation budget of a solution |
+| `VERIFY_MAX_TOKENS` | 4096 | generation budget of a verification round |
+| `MAX_SOLUTION_TOKENS` | 1024 | solution text shown to the verifier (tail kept) |
+| `MAX_ROUND_TOKENS` | 512 | previous final answer shown to the next round (tail kept) |
+| `SOLVE_TEMPERATURE` · `VERIFY_TEMPERATURE` | 1.0 · 1.0 | sampling temperature per phase |
+| `VAL_N` · `VAL_TEMPERATURE` · `VAL_TOP_P` | 4 · 0.6 · 0.95 | evaluation sampling |
+| `SAVE_FREQ` | 100 | checkpoint interval (plus the last step) |
+| `CUDA_VISIBLE_DEVICES` | `0,1,2,3` | GPUs |
 
-## Outputs and metrics
+## 📊 Outputs and monitoring
 
-Each run writes to `outputs/<experiment>/`:
+```text
+$CKPT_ROOT/$EXP_NAME/
+├── global_step_N/            checkpoints (re-launch with the same EXP_NAME to resume)
+├── metrics/*.jsonl           per-step metrics
+├── allocate_repair_logs/     verification-chain examples and run info (config, versions, data manifest)
+├── wandb/                    offline Weights & Biases run
+└── train.log, command.sh
+$TRAJECTORY_DIR/step_NNNNN.jsonl.gz    every prompt and full output of every step
+```
 
-- `train.log`, `command.sh` (exact command line)
-- `wandb/`: offline W&B run. Upload later with `wandb sync outputs/<exp>/wandb/wandb/offline-run-*`
-- `allocate_repair_logs/metrics.jsonl`: every step's metrics, with raw counts next to rates and `null` when unavailable
-- `allocate_repair_logs/examples.jsonl`: bounded samples (step 1 and every `EXAMPLES_INTERVAL`). Each holds question
-  id and text, phase-1 outputs/rewards, the exact repair prompt (messages and rendered), phase-2 outputs/rewards,
-  parent / group ids and token counts.
-- `allocate_repair_logs/run_info.json`: resolved config, software versions, verl commit, data manifest
-- `global_step_N/`: checkpoints (re-running with the same `EXP_NAME` resumes from the latest one)
+Plot a run with `python scripts/plot_run.py <EXP_NAME> --runs-root <dir>`. The panels are written to `result/<EXP_NAME>/`.
 
-Metric groups:
-- `solve/*`: mean r, fraction of questions with ≥1 correct, all-zero / all-one / mixed group fractions and counts
-- `repair/*`: mean e, fraction of failed parents with ≥1 successful repair, group fractions, extraction failures;
-  `repair/available=0` when no repairs exist
-- `train/*`: solve / repair / weighted repair / total loss, per-phase advantage stats, clip fractions, PPO-KL,
-  optional KL, entropy, learning rate, gradient norm
-- `compute/*`, `time/*`, `cumulative/*`: per-phase generation counts, prompt and generated tokens, response-length
-  distribution, truncation and answer-parse-failure rates, wall time per phase, cumulative tokens and time
-- `eval/first_attempt_acc/<set>`: held-out first-attempt accuracy (original question only, no feedback). verl's full
-  `val-core/*` / `val-aux/*` metrics are kept, including an evaluation-only `acc_math_verify` symbolic check.
+| Metric | Meaning |
+|:---|:---|
+| `solve/reward_mean` | phase-1 accuracy (mean $`r_i`$) |
+| `verify/d{d}/match_rate` | round accuracy at depth $`d`$ (mean $`r_d^{\mathrm{verify}}`$) |
+| `verify/d{d}/conclusion_acc` | accuracy of the running conclusion $`c_d`$ |
+| `verify/d1/acc_on_{correct,wrong}_solutions` | first-round accuracy, split by solution outcome |
+| `verify/reward_mean` | summary score $`r^{(M)}_{\mathrm{verify}}`$ |
+| `eval/first_attempt_acc/{dapo_heldout,aime24,aime25,math500}` | held-out accuracy from the question alone |
 
-## Tests
+## 🗂️ Repository layout
 
-`bash scripts/run_unit_tests.sh` (CPU) covers:
-- reward conversion (±1 → 0/1)
-- think-block extraction, including with the real tokenizer
-- no ground-truth or sibling leakage
-- parent-specific grouping
-- zero-variance groups
-- input / padding masking
-- empty repair batches and ranks
-- micro-batch and DP-sharded gradient accumulation (equals the full-batch gradient)
-- invariance of the update to M
-- λ linearity and once-per-phase KL
-- a scripted end-to-end check of the two-phase rollout: counts G + F_q·M, both phases generated before the replicas
-  sleep, batch assembly into the loss
+```text
+allocate_repair/
+├── verify_depth.py          chain logic: running conclusions, target chain, round rewards, prompts
+├── verify_trainer_v2.py     two-phase trainer: solutions, verification chains, round-level examples
+├── agent_loop.py            vLLM agent loop with per-phase sampling settings
+├── losses.py                clipped objective per phase: J_GRPO + J_verify in one update
+├── reward_fn.py             rule-based verifier with binary rewards
+└── config/                  Hydra config (extends verl's PPO trainer)
+scripts/
+├── setup_env.sh             conda environment
+├── download_data.sh         dataset download and preparation
+├── train_verify_depth_v2_qwen3_dapo.sh    training launcher
+└── plot_run.py              progress figures
+tests/test_verify_depth_v2.py             CPU tests of the method
+third_party/verl/            verl v0.9.1 (submodule)
+```
 
-## Notes
+The method is covered by CPU tests: the running-conclusion recursion and its equivalence to the round reward, the
+worked example above, the prompt contents of each round, round rewards and advantages, a scripted end-to-end rollout,
+and the round-level token-mean loss.
 
-- **Token budget.** R1-distill often thinks for more than 8k tokens on hard problems. Truncated responses get
-  reward 0, and their repair prompt shows the extraction-failure placeholder (they are counted in
-  `compute/*/frac_truncated` and `repair/num_extraction_failures`). Raise `SOLVE_MAX_TOKENS` / `REPAIR_MAX_TOKENS`
-  (e.g. 16384) if compute allows; the per-GPU token limits follow automatically.
-- **Out of memory.** Lower `ROLLOUT_GPU_MEM_UTIL` (e.g. 0.5), set `OPTIMIZER_OFFLOAD=True`, or lower
-  `TRAIN_BATCH_SIZE`.
-- **Temperature.** Sampling uses T=1.0, top-p=1.0 by default, so phase samples come from the policy whose log-probs
-  are trained. If the two phases use different temperatures, log-probs are recomputed per row at each phase's
-  temperature.
-- **Scope.** Fixed G and M only; the adaptive allocation scheduler is intentionally not part of this implementation.
+```bash
+python -m pytest -q tests/test_verify_depth_v2.py
+```
+
+<a id="citation"></a>
+
+## 📝 Citation
+
+```bibtex
+@misc{le2026verificationdepth,
+  title        = {Scaling Verification Depth for Stronger Reasoning},
+  author       = {Le, Tue},
+  year         = {2026},
+  month        = {oct},
+  howpublished = {\url{https://github.com/tue09/allocate-repair-RLVR}}
+}
+```
+
+## 🙏 Acknowledgements
+
+Built on [verl](https://github.com/verl-project/verl) and [vLLM](https://github.com/vllm-project/vllm). Trained on
+[DAPO-Math-17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k) with
+[Qwen3](https://huggingface.co/Qwen/Qwen3-1.7B).

@@ -79,10 +79,20 @@ def test_outcome_stats_when_no_repairs_exist():
     assert s["repair/reward_mean"] is None and s["repair/frac_groups_any_correct"] is None
 
 
+def test_single_repair_advantage_is_its_reward():
+    # M=1: every repair group has one sample -> verl uses mean 0, std 1 -> advantage = raw 0/1 reward
+    solve = [1, 0, 0, 0]
+    repairs = [1, 0, 0]  # one repair for each of the 3 failed parents
+    uids = [solve_group_id("q")] * 4 + [repair_group_id(f"q/y{i}") for i in (1, 2, 3)]
+    adv = grpo(solve + repairs, uids)
+    np.testing.assert_allclose(adv[4:], [1 / (1 + 1e-6), 0.0, 0.0], atol=1e-6)
+
+
 def test_budget_rules():
     validate_budget(2, 0)
+    validate_budget(4, 1)
     validate_budget(8, 4)
-    for G, M in [(1, 4), (8, 1)]:
+    for G, M in [(1, 4), (8, -1)]:
         with pytest.raises(ValueError):
             validate_budget(G, M)
     # G + F_q * M generations per question, not G + M

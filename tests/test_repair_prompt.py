@@ -68,6 +68,46 @@ def test_single_turn_prompt_keeps_question_verbatim():
     assert QUESTION[0]["content"] == "Solve: what is 6*7? End with Answer: $Answer."  # input not mutated
 
 
+def test_v3_prompt_from_config():
+    from conftest import compose_config
+
+    from allocate_repair.repair import V3_NO_FINAL_ANSWER_INSTRUCTION, V3_WRONG_ANSWER_INSTRUCTION, builder_from_config
+
+    repair_cfg = compose_config().allocate_repair.repair
+    assert repair_cfg.prompt_version == "v3"
+    assert repair_cfg.v3.wrong_answer_instruction == V3_WRONG_ANSWER_INSTRUCTION
+    assert repair_cfg.v3.no_final_answer_instruction == V3_NO_FINAL_ANSWER_INSTRUCTION
+    for text in (V3_WRONG_ANSWER_INSTRUCTION, V3_NO_FINAL_ANSWER_INSTRUCTION):
+        assert "step by step" not in text and text.endswith('"Answer: $Answer".')
+    assert "Do not solve the problem from scratch" in V3_WRONG_ANSWER_INSTRUCTION
+    assert "\n# REASON WHY THE PREVIOUS ANSWER WAS WRONG:\n" in V3_WRONG_ANSWER_INSTRUCTION
+
+    builder = builder_from_config(repair_cfg)
+    wrong = builder.build(QUESTION, "Answer: 41")[0]["content"]
+    assert wrong.startswith(QUESTION[0]["content"]) and wrong.endswith(V3_WRONG_ANSWER_INSTRUCTION)
+    failed = builder.build(QUESTION, builder.failure_placeholder, extraction_ok=False)[0]["content"]
+    assert failed.endswith(V3_NO_FINAL_ANSWER_INSTRUCTION) and builder.failure_placeholder in failed
+
+    v1 = builder_from_config(compose_config(["allocate_repair.repair.prompt_version=v1"]).allocate_repair.repair)
+    assert v1.build(QUESTION, "x", extraction_ok=False)[0]["content"].endswith(repair_cfg.instruction)
+    with pytest.raises(ValueError):
+        builder_from_config(compose_config(["allocate_repair.repair.prompt_version=v2"]).allocate_repair.repair)
+
+
+def test_v3_routing_in_build_repair_requests(fake_tokenizer):
+    from allocate_repair.repair import V3_NO_FINAL_ANSWER_INSTRUCTION, V3_WRONG_ANSWER_INSTRUCTION
+
+    builder = RepairPromptBuilder(instruction=V3_WRONG_ANSWER_INSTRUCTION,
+                                  failure_instruction=V3_NO_FINAL_ANSWER_INSTRUCTION)
+    responses = {0: ids(fake_tokenizer, "r </think> Answer: 40"), 1: ids(fake_tokenizer, "never closes", eos=False)}
+    requests, stats = build_repair_requests(
+        failed_rows=[0, 1], response_ids=responses, question_messages={0: QUESTION, 1: QUESTION},
+        extractor=AnswerExtractor(fake_tokenizer), builder=builder, tokenizer=fake_tokenizer, max_prompt_tokens=4096)
+    by_row = {r.parent_index: r.messages[0]["content"] for r in requests}
+    assert by_row[0].endswith(V3_WRONG_ANSWER_INSTRUCTION) and "Answer: 40" in by_row[0]
+    assert by_row[1].endswith(V3_NO_FINAL_ANSWER_INSTRUCTION) and stats["extraction_failures"] == 1
+
+
 def test_multi_turn_prompt_structure():
     msgs = RepairPromptBuilder(prompt_format="multi_turn").build(QUESTION, "Answer: 41")
     assert [m["role"] for m in msgs] == ["user", "assistant", "user"]
@@ -149,3 +189,28 @@ def test_real_tokenizer_think_extraction():
     msgs = RepairPromptBuilder().build(QUESTION, res.text)
     rendered = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
     assert "Let me compute" not in rendered and QUESTION[0]["content"] in rendered
+
+
+@pytest.mark.skipif(not os.environ.get("AR_TEST_TOKENIZER"), reason="set AR_TEST_TOKENIZER=<model path> to run")
+@pytest.mark.parametrize("prompt_format", ["single_turn", "multi_turn"])
+def test_real_tokenizer_rollout_prompt_builder(prompt_format):
+    """The configured builder model_type must accept the real tokenizer and render its own chat template.
+
+    AR_TEST_TOKEN_BUILDER overrides allocate_repair.token_builder_model_type like the launch script does ("null": the
+    model's config.json model_type, e.g. Qwen3)."""
+    import json
+
+    from conftest import compose_config
+    from transformers import AutoTokenizer
+    from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+
+    tok = AutoTokenizer.from_pretrained(os.environ["AR_TEST_TOKENIZER"])
+    model_type = os.environ.get("AR_TEST_TOKEN_BUILDER", compose_config().allocate_repair.token_builder_model_type)
+    if model_type in (None, "null"):
+        model_type = json.load(open(os.path.join(os.environ["AR_TEST_TOKENIZER"], "config.json")))["model_type"]
+    builder = create_continuous_token_builder(tok, hf_model_type=model_type)
+    repair = RepairPromptBuilder(prompt_format=prompt_format).build(QUESTION, "The answer is 41.\n\nAnswer: 41")
+    for msgs in (QUESTION, repair):
+        expected = tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+        expected = list(expected["input_ids"] if hasattr(expected, "keys") else expected)
+        assert builder.build_initial_tokens(msgs) == expected

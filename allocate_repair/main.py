@@ -51,7 +51,17 @@ class AllocateRepairTaskRunner(BaseTaskRunner):
         from verl.workers.config import HFModelConfig
 
         from allocate_repair.trainer import AllocateRepairTrainer
+        from allocate_repair.verify_trainer import VerifyDepthTrainer
+        from allocate_repair.verify_trainer_v2 import VerifyDepthV2Trainer
 
+        # phase 2: explain-and-repair (default) or depth-M verification chains (Scaling Verification Depth, note
+        # versions 1 and 2)
+        method = str(config.allocate_repair.get("method", "repair"))
+        trainers = {"repair": AllocateRepairTrainer, "verify_depth": VerifyDepthTrainer,
+                    "verify_depth_v2": VerifyDepthV2Trainer}
+        trainer_cls = trainers.get(method)
+        if trainer_cls is None:
+            raise ValueError(f"unknown allocate_repair.method {method!r} ({' | '.join(trainers)})")
         model_config: HFModelConfig = omega_conf_to_dataclass(config.actor_rollout_ref.model)
         tokenizer, processor = model_config.tokenizer, model_config.processor
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -71,7 +81,7 @@ class AllocateRepairTaskRunner(BaseTaskRunner):
             is_train=False,
             max_samples=config.data.get("val_max_samples", -1),
         )
-        trainer = AllocateRepairTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
